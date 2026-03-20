@@ -1,7 +1,6 @@
 const readline = require("readline");
 const { spawn, spawnSync } = require("child_process");
 const fs = require("fs");
-const path = require("path");
 
 // ================= CONFIGURATION =================
 const STREAM_FILE = "streams.json";
@@ -35,11 +34,15 @@ let destinations = fs.existsSync(DEST_FILE)
 
 // Save Data Helpers
 function saveStreams() {
-  fs.writeFileSync(STREAM_FILE, JSON.stringify(streams, null, 2));
+  try {
+    fs.writeFileSync(STREAM_FILE, JSON.stringify(streams, null, 2));
+  } catch (e) {}
 }
 
 function saveDest() {
-  fs.writeFileSync(DEST_FILE, JSON.stringify(destinations, null, 2));
+  try {
+    fs.writeFileSync(DEST_FILE, JSON.stringify(destinations, null, 2));
+  } catch (e) {}
 }
 
 // Input Helper
@@ -68,9 +71,9 @@ function resolveInputUrl(url, cookiesFile = null) {
       "--no-warnings",
       "--user-agent",
       YTDLP_USER_AGENT,
-      // Force a single file format to prevent getting "video only" or "audio only" URLs
+      // Force a single file format
       "-f",
-      "best[ext=mp4]/best", 
+      "best[ext=mp4]/best",
     ];
 
     if (cookiesFile) {
@@ -85,7 +88,6 @@ function resolveInputUrl(url, cookiesFile = null) {
     const out = (res.stdout || "").trim();
     if (!out) return null;
 
-    // Just take the first valid URL
     return out.split(/\r?\n/)[0].trim();
   } catch (err) {
     return null;
@@ -110,15 +112,7 @@ async function menu() {
   if (choice === "2") return stop();
   if (choice === "3") return view();
   if (choice === "4") return cleanup();
-  if (choice === "5") {
-    // Optional: Kill all running streams on exit
-    /* 
-    Object.keys(streams).forEach(id => {
-       if(streams[id].status === 'LIVE') killStream(id);
-    });
-    */
-    process.exit(0);
-  }
+  if (choice === "5") process.exit(0);
 
   console.log("Invalid choice\n");
   return menu();
@@ -164,23 +158,23 @@ async function start() {
     console.log(`⚠️  Cookies file not found. Proceeding without cookies.`);
   }
 
-  // 3. Determine Mode (Pipe vs Direct)
+  // 3. Determine Mode
   let useYtDlpPipe = false;
   let inputUrl = url.trim();
   let resolvedUrl = null;
 
   if (hasYtdlp) {
     const pipeAnswer = await ask(
-      "Use yt-dlp Pipe Mode? (Recommended for YouTube/Facebook) (y/n): "
+      "Use yt-dlp Pipe Mode? (Recommended) (y/n): "
     );
     useYtDlpPipe = pipeAnswer.trim().toLowerCase().startsWith("y");
 
     if (!useYtDlpPipe) {
       const resolveAnswer = await ask(
-        "Resolve URL to direct link? (Avoids URL expiration issues) (y/n): "
+        "Resolve URL to direct link? (y/n): "
       );
       if (resolveAnswer.trim().toLowerCase().startsWith("y")) {
-        console.log("Resolving URL... (this may take a moment)");
+        console.log("Resolving URL...");
         resolvedUrl = resolveInputUrl(inputUrl, cookiesFile || null);
         if (resolvedUrl) {
           console.log("✅ Resolved to:", resolvedUrl);
@@ -206,43 +200,65 @@ async function start() {
   const ffmpegArgs = ["-re"];
   const finalInput = resolvedUrl || inputUrl;
   
-  // If looping is requested and not piping, add loop flag
   if (shouldLoop && !useYtDlpPipe) {
     ffmpegArgs.push("-stream_loop", "-1");
   }
 
-  // Input source
+  // INPUT: 
+  // We do NOT use -f mp4. We let ffmpeg auto-detect.
+  // This prevents crashes when the pipe data format isn't exactly what ffmpeg expects immediately.
   if (useYtDlpPipe) {
-    // In pipe mode, ffmpeg reads from stdin
-    // We specify -f mp4 so ffmpeg knows what's coming down the pipe
-    ffmpegArgs.push("-f", "mp4", "-i", "pipe:0");
+    ffmpegArgs.push("-i", "pipe:0");
   } else {
     ffmpegArgs.push("-i", finalInput);
   }
 
-  // Output settings (Copy codecs, FLV format for RTMP)
-  ffmpegArgs.push("-c", "copy", "-f", "flv", `${dest.rtmp}/${dest.key}`);
+  // OUTPUT:
+  // We use TRANSCODING instead of -c copy.
+  // Many RTMP servers reject "copy" if the source codec is VP9, AV1, or specific AAC profiles.
+  // libx264 + aac is the universal standard for RTMP.
+  ffmpegArgs.push(
+    "-c:v", "libx264", 
+    "-preset", "ultrafast", // Uses less CPU
+    "-tune", "zerolatency", // Optimized for live streaming
+    "-c:a", "aac", 
+    "-b:a", "128k", 
+    "-f", "flv", 
+    `${dest.rtmp}/${dest.key}`
+  );
 
-  console.log("\nStarting ffmpeg...");
+  console.log("\nStarting ffmpeg (Transcoding to H264/AAC for compatibility)...");
 
   const ffmpeg = spawn("ffmpeg", ffmpegArgs, {
     stdio: useYtDlpPipe ? ["pipe", "inherit", "pipe"] : "pipe",
   });
 
+  // ==========================================
+  // SAFE PIPE LOGIC (The Fix for EPIPE)
+  // ==========================================
   let ytdlp = null;
   if (useYtDlpPipe) {
-    // yt-dlp args for piping
-    // -f best: Selects best single file (prevents merge-to-stdout errors)
-    // -o -: Output to stdout
+    
+    // 1. Handle FFmpeg stdin errors (EPIPE)
+    ffmpeg.stdin.on("error", (err) => {
+      if (err.code === "EPIPE") {
+        // This happens if ffmpeg dies before yt-dlp finishes
+        // We log it but don't crash the whole Node process
+        // console.log("⚠️  Pipe closed (FFmpeg exited early)");
+      } else {
+        console.error("FFmpeg stdin error:", err);
+      }
+    });
+
+    // 2. Spawn yt-dlp
+    // -f best: get best single file (video+audio combined)
     const ytdlpArgs = [
       "--no-playlist",
       "--no-warnings",
       "--user-agent",
       YTDLP_USER_AGENT,
-      "-f",
-      "best", 
-      "-o",
-      "-",
+      "-f", "best",
+      "-o", "-",
     ];
 
     if (cookiesFile && fs.existsSync(cookiesFile)) {
@@ -251,28 +267,48 @@ async function start() {
     ytdlpArgs.push(inputUrl);
 
     ytdlp = spawn("yt-dlp", ytdlpArgs, {
-      stdio: ["ignore", "pipe", "pipe"], // Ignore stdin, pipe stdout, capture stderr
+      stdio: ["ignore", "pipe", "pipe"],
     });
 
-    // Pipe yt-dlp output directly to ffmpeg input
-    ytdlp.stdout.pipe(ffmpeg.stdin);
+    // 3. Manual Piping with Backpressure handling
+    ytdlp.stdout.on("data", (chunk) => {
+      // If ffmpeg is dead or closed stdin, stop yt-dlp
+      if (ffmpeg.killed || !ffmpeg.stdin.writable) {
+        ytdlp.kill();
+        return;
+      }
 
-    ytdlp.stderr.on("data", (chunk) => {
-      // Optional: Log yt-dlp errors if needed, or suppress to keep console clean
-      // console.log("yt-dlp:", chunk.toString());
+      // Write chunk. If buffer is full, pause yt-dlp
+      const ok = ffmpeg.stdin.write(chunk);
+      if (!ok) {
+        ytdlp.stdout.pause();
+      }
+    });
+
+    // 4. Resume yt-dlp when ffmpeg drains buffer
+    ffmpeg.stdin.on("drain", () => {
+      if (ytdlp.stdout && !ytdlp.stdout.destroyed) {
+        ytdlp.stdout.resume();
+      }
+    });
+
+    // 5. Cleanup when yt-dlp finishes
+    ytdlp.stdout.on("end", () => {
+      if (ffmpeg.stdin.writable) {
+        ffmpeg.stdin.end();
+      }
     });
 
     ytdlp.on("exit", (code) => {
       if (streams[id] && streams[id].status !== "STOPPED") {
         streams[id].status = "FAILED";
-        streams[id].error = `yt-dlp exited with code ${code}`;
+        streams[id].error = `yt-dlp exited early (code ${code})`;
         saveStreams();
-        console.log(`\n⚠️  Stream ${id} yt-dlp process stopped.`);
       }
     });
   }
 
-  // 6. Manage Stream State
+  // 6. State Management
   streams[id] = {
     pid: ffmpeg.pid,
     ytdlpPid: ytdlp ? ytdlp.pid : null,
@@ -285,10 +321,14 @@ async function start() {
   };
   saveStreams();
 
+  // 7. Log FFmpeg output (Crucial for debugging)
   ffmpeg.stderr.on("data", (data) => {
     const msg = data.toString();
+    
+    // Print to console so user sees what's happening
+    // You can comment this out if it's too spammy
+    // console.log(`[FFmpeg ${id}]: ${msg.trim()}`);
 
-    // Detect Success
     if (msg.includes("Press [q]")) {
       if (streams[id].status !== "LIVE") {
         streams[id].status = "LIVE";
@@ -297,31 +337,35 @@ async function start() {
       }
     }
 
-    // Detect Failure (Basic keywords)
+    // Detect explicit errors
     if (
       msg.includes("Connection refused") ||
-      msg.includes("403 Forbidden") ||
-      msg.includes("Invalid data found")
+      msg.includes("403") ||
+      msg.includes("404") ||
+      msg.includes("Server returned 4")
     ) {
       streams[id].status = "FAILED";
-      streams[id].error = msg.slice(0, 150).replace(/\n/g, " ");
+      streams[id].error = msg.slice(0, 150);
       saveStreams();
+      console.log(`\n❌ Stream ${id} Failed: ${streams[id].error}`);
     }
   });
 
   ffmpeg.on("exit", (code) => {
     if (!streams[id]) return;
+    
+    // If ffmpeg crashes, ensure yt-dlp is killed
+    if (ytdlp && !ytdlp.killed) {
+      ytdlp.kill();
+    }
+
     if (streams[id].status !== "FAILED") {
       streams[id].status = "STOPPED";
     }
     saveStreams();
-    // If ffmpeg dies, we should also kill yt-dlp if it's still running
-    if (ytdlp && ytdlp.exitCode === null) {
-      ytdlp.kill();
-    }
+    console.log(`\n🛑 Stream ${id} process stopped (Code: ${code}).\n`);
   });
 
-  console.log(`Stream "${id}" process started (PID: ${ffmpeg.pid}).`);
   menu();
 }
 
@@ -373,18 +417,12 @@ function killStream(id) {
   if (!s) return;
 
   try {
-    // Kill ffmpeg
     if (s.pid) process.kill(s.pid);
-  } catch (e) {
-    // Process might already be dead
-  }
+  } catch (e) {}
 
   try {
-    // Kill yt-dlp
     if (s.ytdlpPid) process.kill(s.ytdlpPid);
-  } catch (e) {
-    // Process might already be dead
-  }
+  } catch (e) {}
 
   s.status = "STOPPED";
   saveStreams();
