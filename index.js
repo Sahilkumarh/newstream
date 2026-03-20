@@ -1,14 +1,36 @@
 const readline = require("readline");
 const { spawn, spawnSync } = require("child_process");
 const fs = require("fs");
+const path = require("path");
 
 // ================= CONFIGURATION =================
 const STREAM_FILE = "streams.json";
 const DEST_FILE = "destinations.json";
+const LOG_FILE = "logs.txt";
 const YTDLP_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
 
-// Check for yt-dlp
+// ================= LOGGING SYSTEM =================
+// Writes to file, only prints short summary to console
+function writeLog(msg, type = "INFO") {
+  const timestamp = new Date().toISOString();
+  const logMsg = `[${timestamp}] [${type}] ${msg}\n`;
+  fs.appendFileSync(LOG_FILE, logMsg);
+}
+
+function getLogs(lines = 30) {
+  if (!fs.existsSync(LOG_FILE)) return "No logs found.";
+  const content = fs.readFileSync(LOG_FILE, "utf8");
+  const allLines = content.trim().split("\n");
+  return allLines.slice(-lines).join("\n");
+}
+
+function clearLogs() {
+  if (fs.existsSync(LOG_FILE)) fs.unlinkSync(LOG_FILE);
+  writeLog("Logs cleared by user.", "SYSTEM");
+}
+
+// ================= DATA HELPERS =================
 let hasYtdlp = false;
 try {
   const check = spawnSync("yt-dlp", ["--version"], { encoding: "utf8" });
@@ -17,13 +39,6 @@ try {
   hasYtdlp = false;
 }
 
-if (!hasYtdlp) {
-  console.log(
-    "⚠️  yt-dlp not found. YouTube/Facebook URLs will not work reliably."
-  );
-}
-
-// Load Data
 let streams = fs.existsSync(STREAM_FILE)
   ? JSON.parse(fs.readFileSync(STREAM_FILE))
   : {};
@@ -32,20 +47,22 @@ let destinations = fs.existsSync(DEST_FILE)
   ? JSON.parse(fs.readFileSync(DEST_FILE))
   : [];
 
-// Save Data Helpers
 function saveStreams() {
-  try {
-    fs.writeFileSync(STREAM_FILE, JSON.stringify(streams, null, 2));
-  } catch (e) {}
+  try { fs.writeFileSync(STREAM_FILE, JSON.stringify(streams, null, 2)); } catch(e){}
 }
 
 function saveDest() {
-  try {
-    fs.writeFileSync(DEST_FILE, JSON.stringify(destinations, null, 2));
-  } catch (e) {}
+  try { fs.writeFileSync(DEST_FILE, JSON.stringify(destinations, null, 2)); } catch(e){}
 }
 
-// Input Helper
+function joinRtmpUrl(rtmp, key) {
+  if (!rtmp || !key) return "";
+  const cleanRtmp = rtmp.replace(/\/+$/, "");
+  const cleanKey = key.replace(/^\/+/, "");
+  return `${cleanRtmp}/${cleanKey}`;
+}
+
+// ================= INPUT HELPER =================
 const rl = readline.createInterface({
   input: process.stdin,
   output: process.stdout,
@@ -55,461 +72,355 @@ function ask(q) {
   return new Promise((res) => rl.question(q, res));
 }
 
-// ================= HELPERS =================
-
-/**
- * Safely joins RTMP URL and Key, removing accidental double slashes.
- * e.g. "rtmp://a.rtmp.com/live/" + "/key" -> "rtmp://a.rtmp.com/live/key"
- */
-function joinRtmpUrl(rtmp, key) {
-  if (!rtmp || !key) return "";
-  
-  // Remove trailing slashes from RTMP
-  const cleanRtmp = rtmp.replace(/\/+$/, "");
-  
-  // Remove leading slashes from Key
-  const cleanKey = key.replace(/^\/+/, "");
-  
-  return `${cleanRtmp}/${cleanKey}`;
-}
+// ================= CORE LOGIC =================
 
 function resolveInputUrl(url, cookiesFile = null) {
   if (!hasYtdlp) return null;
-
   try {
-    const args = [
-      "-g",
-      "--no-playlist",
-      "--no-warnings",
-      "--user-agent",
-      YTDLP_USER_AGENT,
-      "-f",
-      "best[ext=mp4]/best",
-    ];
-
-    if (cookiesFile) {
-      args.push("--cookies", cookiesFile);
-    }
-
+    const args = ["-g", "--no-playlist", "--no-warnings", "--user-agent", YTDLP_USER_AGENT, "-f", "best[ext=mp4]/best"];
+    if (cookiesFile) args.push("--cookies", cookiesFile);
     args.push(url);
-
     const res = spawnSync("yt-dlp", args, { encoding: "utf8" });
     if (res.status !== 0) return null;
-
     const out = (res.stdout || "").trim();
-    if (!out) return null;
-
-    return out.split(/\r?\n/)[0].trim();
-  } catch (err) {
-    return null;
-  }
+    return out ? out.split(/\r?\n/)[0].trim() : null;
+  } catch (err) { return null; }
 }
 
-// ================= MENU =================
-async function menu() {
-  console.log("\n==============================");
-  console.log("🎥 STREAM CONTROL PANEL");
-  console.log("==============================\n");
-
-  console.log("1. Start Stream");
-  console.log("2. Stop Stream");
-  console.log("3. View Dashboard");
-  console.log("4. Clear Stopped/Failed");
-  console.log("5. Exit\n");
-
-  const choice = await ask("Enter choice: ");
-
-  if (choice === "1") return start();
-  if (choice === "2") return stop();
-  if (choice === "3") return view();
-  if (choice === "4") return cleanup();
-  if (choice === "5") process.exit(0);
-
-  console.log("Invalid choice\n");
-  return menu();
-}
-
-// ================= START =================
-async function start() {
-  console.log("\n--- Start Stream ---\n");
-
-  // 1. Select Destination
-  let dest;
-  if (destinations.length > 0) {
-    destinations.forEach((d, i) => {
-      console.log(`${i + 1}. ${d.name}`);
-    });
-    console.log(`${destinations.length + 1}. Add New\n`);
-
-    const dChoice = await ask("Select destination: ");
-    const idx = parseInt(dChoice);
-
-    if (idx === destinations.length + 1) {
-      dest = await addDestination();
-    } else if (idx > 0 && idx <= destinations.length) {
-      dest = destinations[idx - 1];
-    } else {
-      console.log("Invalid selection.");
-      return menu();
-    }
-  } else {
-    dest = await addDestination();
-  }
-
-  // 2. Get Input Details
-  const id = await ask("Stream ID: ");
-  if (streams[id]) {
-    console.log("⚠️  Stream ID already exists\n");
-    return menu();
-  }
-
-  const url = await ask("Input video URL: ");
-  const cookiesFile = (await ask("Cookies file path (leave blank to skip): ")).trim();
-  if (cookiesFile && !fs.existsSync(cookiesFile)) {
-    console.log(`⚠️  Cookies file not found. Proceeding without cookies.`);
-  }
-
-  // 3. Determine Mode
-  let useYtDlpPipe = false;
-  let inputUrl = url.trim();
-  let resolvedUrl = null;
-
-  if (hasYtdlp) {
-    const pipeAnswer = await ask(
-      "Use yt-dlp Pipe Mode? (Recommended) (y/n): "
-    );
-    useYtDlpPipe = pipeAnswer.trim().toLowerCase().startsWith("y");
-
-    if (!useYtDlpPipe) {
-      const resolveAnswer = await ask(
-        "Resolve URL to direct link? (y/n): "
-      );
-      if (resolveAnswer.trim().toLowerCase().startsWith("y")) {
-        console.log("Resolving URL...");
-        resolvedUrl = resolveInputUrl(inputUrl, cookiesFile || null);
-        if (resolvedUrl) {
-          console.log("✅ Resolved to:", resolvedUrl);
-        } else {
-          console.log("⚠️  Resolution failed. Using original URL.");
-        }
-      }
-    }
-  } else {
-    console.log("ℹ️  Running in Direct Mode (no yt-dlp detected).");
-  }
-
-  // 4. Looping
-  let shouldLoop = false;
-  if (!useYtDlpPipe) {
-    const loopAnswer = await ask("Loop input when it ends? (y/n): ");
-    shouldLoop = loopAnswer.trim().toLowerCase().startsWith("y");
-  } else {
-    console.log("ℹ️  Looping is disabled in Pipe Mode.");
-  }
-
-  // 5. Construct Commands
-  const ffmpegArgs = ["-re"];
-  const finalInput = resolvedUrl || inputUrl;
+// --- THE ACTUAL STREAM LAUNCHER ---
+// Can be called by "Start New" or "Restart"
+function launchStream(id, config) {
+  const { url, destIndex, usePipe, loop, cookiesFile, resolvedUrl } = config;
   
-  if (shouldLoop && !useYtDlpPipe) {
-    ffmpegArgs.push("-stream_loop", "-1");
+  if (streams[id] && (streams[id].status === "LIVE" || streams[id].status === "STARTING")) {
+    console.log(`⚠️  Stream ${id} is already running.`);
+    return;
   }
 
-  // INPUT
-  if (useYtDlpPipe) {
+  const dest = destinations[destIndex];
+  if (!dest) {
+    console.log("❌ Destination removed. Cannot start stream.");
+    return;
+  }
+
+  const fullUrl = joinRtmpUrl(dest.rtmp, dest.key);
+  console.log(`\n🚀 Starting ${id} -> ${dest.name}...`);
+  writeLog(`Starting stream ${id} to ${fullUrl}`);
+
+  const ffmpegArgs = ["-re"];
+  const finalInput = resolvedUrl || url;
+
+  if (loop && !usePipe) ffmpegArgs.push("-stream_loop", "-1");
+
+  if (usePipe) {
     ffmpegArgs.push("-i", "pipe:0");
   } else {
     ffmpegArgs.push("-i", finalInput);
   }
 
-  // OUTPUT
-  // FIXED URL JOINING LOGIC HERE
-  const fullStreamUrl = joinRtmpUrl(dest.rtmp, dest.key);
-  
-  console.log(`\n[INFO] Connecting to: ${fullStreamUrl}`);
-
-  ffmpegArgs.push(
-    "-c:v", "libx264", 
-    "-preset", "ultrafast", 
-    "-tune", "zerolatency", 
-    "-c:a", "aac", 
-    "-b:a", "128k", 
-    "-f", "flv", 
-    fullStreamUrl
-  );
-
-  console.log("[INFO] Starting ffmpeg...");
+  ffmpegArgs.push("-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-c:a", "aac", "-b:a", "128k", "-f", "flv", fullUrl);
 
   const ffmpeg = spawn("ffmpeg", ffmpegArgs, {
-    stdio: useYtDlpPipe ? ["pipe", "inherit", "pipe"] : "pipe",
+    stdio: usePipe ? ["pipe", "inherit", "pipe"] : "pipe",
   });
 
-  // Buffer to capture the last line of error
-  let lastFfmpegError = "Unknown error";
-
-  // ==========================================
-  // SAFE PIPE LOGIC
-  // ==========================================
+  let lastError = "Unknown error";
   let ytdlp = null;
-  if (useYtDlpPipe) {
+
+  if (usePipe) {
+    ffmpeg.stdin.on("error", (err) => { if (err.code !== "EPIPE") writeLog(`STDIN Error: ${err.message}`, "ERROR"); });
+
+    const ytdlpArgs = ["--no-playlist", "--no-warnings", "--user-agent", YTDLP_USER_AGENT, "-f", "best", "-o", "-", url];
+    if (cookiesFile && fs.existsSync(cookiesFile)) ytdlpArgs.push("--cookies", cookiesFile);
     
-    ffmpeg.stdin.on("error", (err) => {
-      if (err.code === "EPIPE") {
-        // Ignore EPIPE
-      } else {
-        console.error("[STDIN ERROR]:", err.message);
-      }
-    });
-
-    const ytdlpArgs = [
-      "--no-playlist",
-      "--no-warnings",
-      "--user-agent",
-      YTDLP_USER_AGENT,
-      "-f", "best",
-      "-o", "-",
-    ];
-
-    if (cookiesFile && fs.existsSync(cookiesFile)) {
-      ytdlpArgs.push("--cookies", cookiesFile);
-    }
-    ytdlpArgs.push(inputUrl);
-
-    ytdlp = spawn("yt-dlp", ytdlpArgs, {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    ytdlp = spawn("yt-dlp", ytdlpArgs, { stdio: ["ignore", "pipe", "pipe"] });
 
     ytdlp.stdout.on("data", (chunk) => {
-      if (ffmpeg.killed || !ffmpeg.stdin.writable) {
-        ytdlp.kill();
-        return;
-      }
-
-      const ok = ffmpeg.stdin.write(chunk);
-      if (!ok) {
-        ytdlp.stdout.pause();
-      }
+      if (ffmpeg.killed || !ffmpeg.stdin.writable) { ytdlp.kill(); return; }
+      if (!ffmpeg.stdin.write(chunk)) ytdlp.stdout.pause();
     });
 
-    ffmpeg.stdin.on("drain", () => {
-      if (ytdlp.stdout && !ytdlp.stdout.destroyed) {
-        ytdlp.stdout.resume();
-      }
+    ffmpeg.stdin.on("drain", () => { if (ytdlp.stdout && !ytdlp.stdout.destroyed) ytdlp.stdout.resume(); });
+    
+    ytdlp.stdout.on("end", () => { if (ffmpeg.stdin.writable) ffmpeg.stdin.end(); });
+    
+    ytdlp.stderr.on("data", (d) => {
+        const msg = d.toString();
+        if(msg.includes("ERROR") || msg.includes("Sign in")) lastError = `yt-dlp: ${msg.trim()}`;
     });
 
-    ytdlp.stdout.on("end", () => {
-      if (ffmpeg.stdin.writable) {
-        ffmpeg.stdin.end();
-      }
-    });
-
-    ytdlp.stderr.on("data", (data) => {
-        const msg = data.toString();
-        if(msg.includes("ERROR:") || msg.includes("Sign in")) {
-             console.log(`[YTDLP ERROR] ${msg.trim()}`);
-             lastFfmpegError = `yt-dlp: ${msg.trim()}`;
-        }
-    });
-
-    ytdlp.on("exit", (code) => {
+    ytdlp.on("exit", (c) => {
       if (streams[id] && streams[id].status !== "STOPPED") {
         streams[id].status = "FAILED";
-        streams[id].error = `yt-dlp exited (code ${code})`;
+        streams[id].error = lastError;
         saveStreams();
+        console.log(`❌ Stream ${id} failed (yt-dlp exited). See logs.`);
       }
     });
   }
 
-  // 6. State Management
   streams[id] = {
     pid: ffmpeg.pid,
     ytdlpPid: ytdlp ? ytdlp.pid : null,
-    url: inputUrl,
+    url,
     platform: dest.name,
-    mode: useYtDlpPipe ? "PIPE" : "DIRECT",
+    mode: usePipe ? "PIPE" : "DIRECT",
     started: new Date().toLocaleString(),
     status: "STARTING",
     error: "",
+    // Save config for restart
+    config: { url, destIndex, usePipe, loop, cookiesFile, resolvedUrl }
   };
   saveStreams();
 
-  // 7. LOGGING & ERROR CAPTURE
   ffmpeg.stderr.on("data", (data) => {
     const msg = data.toString();
-    
-    if (msg.includes("frame=")) {
-       // Optional: Uncomment to see frame stats
-       // process.stdout.write(`\r[FFmpeg] ${msg.trim().substring(0, 50)}...`);
-    } else {
-       console.log(`[FFmpeg] ${msg.trim()}`);
-    }
-
-    if (
-      msg.includes("Error") ||
-      msg.includes("Invalid") ||
-      msg.includes("Connection") ||
-      msg.includes("403") ||
-      msg.includes("404") ||
-      msg.includes("Unknown encoder")
-    ) {
-      lastFfmpegError = msg.trim();
-    }
+    writeLog(`[FFmpeg ${id}] ${msg.trim()}`); // Write full log to file
 
     if (msg.includes("Press [q]")) {
       if (streams[id].status !== "LIVE") {
         streams[id].status = "LIVE";
         saveStreams();
-        console.log(`\n🚀 Stream ${id} is now LIVE!\n`);
+        console.log(`✅ Stream ${id} is LIVE`);
       }
+    }
+    if (msg.includes("Error") || msg.includes("403") || msg.includes("Connection refused")) {
+      lastError = msg.trim();
     }
   });
 
   ffmpeg.on("exit", (code) => {
     if (!streams[id]) return;
+    if (ytdlp && !ytdlp.killed) ytdlp.kill();
     
-    if (ytdlp && !ytdlp.killed) {
-      ytdlp.kill();
-    }
-
-    if (streams[id].status !== "FAILED") {
-      streams[id].status = "STOPPED";
-    }
-    
-    if (code !== 0) {
-        streams[id].error = lastFfmpegError;
-        
-        if (lastFfmpegError.includes("Unknown encoder 'libx264'")) {
-            console.log("\n❌ CRITICAL ERROR: Missing 'libx264' in FFmpeg.");
-            console.log("   Install a full version of ffmpeg.");
-        } else if (lastFfmpegError.includes("403")) {
-            console.log("\n❌ ERROR: Access denied (403).");
-            console.log("   Check cookies or VPN.");
-        }
-    }
-
+    streams[id].status = code === 0 ? "STOPPED" : "FAILED";
+    if (code !== 0) streams[id].error = lastError;
     saveStreams();
-    console.log(`\n🛑 Stream ${id} process stopped (Code: ${code}).\n`);
-    console.log(`   Reason: ${lastFfmpegError}\n`);
+    
+    if (code !== 0) console.log(`❌ Stream ${id} stopped with error. Check logs.`);
+    else console.log(`🛑 Stream ${id} stopped.`);
   });
-
-  menu();
 }
 
-// ================= ADD DEST =================
-async function addDestination() {
-  console.log("\n--- Add New Platform ---\n");
-  const name = await ask("Name (e.g., YouTube Main): ");
-  const rtmp = await ask("RTMP URL (e.g., rtmp://a.rtmp.youtube.com/live2): ");
-  const key = await ask("Stream Key: ");
+// ================= MENUS =================
 
-  const obj = { name, rtmp, key };
-  destinations.push(obj);
-  saveDest();
-  return obj;
-}
+async function mainMenu() {
+  while(true) {
+    console.log("\n==============================");
+    console.log("🎥 STREAM CONTROL PANEL");
+    console.log("==============================\n");
 
-// ================= STOP =================
-async function stop() {
-  console.log("\n--- Stop Stream ---\n");
+    console.log("1. Manage Streams (Start/Stop/Restart)");
+    console.log("2. Manage Destinations (Keys)");
+    console.log("3. View Logs");
+    console.log("4. Clear Logs");
+    console.log("5. Exit\n");
 
-  const ids = Object.keys(streams).filter(
-    (id) => streams[id].status === "STARTING" || streams[id].status === "LIVE"
-  );
+    const choice = await ask("Enter choice: ");
 
-  if (ids.length === 0) {
-    console.log("No active streams running.\n");
-    return menu();
+    if (choice === "1") return streamMenu();
+    if (choice === "2") return destMenu();
+    if (choice === "3") {
+      console.log("\n--- LAST 30 LOG LINES ---\n");
+      console.log(getLogs(30));
+      console.log("--------------------------\n");
+    }
+    if (choice === "4") {
+      clearLogs();
+      console.log("🧹 Logs cleared.");
+    }
+    if (choice === "5") process.exit(0);
   }
+}
+
+// --- STREAM MENU ---
+async function streamMenu() {
+  while(true) {
+    console.log("\n--- MANAGE STREAMS ---\n");
+    
+    // Quick Status
+    const active = Object.values(streams).filter(s => s.status === "LIVE" || s.status === "STARTING").length;
+    const failed = Object.values(streams).filter(s => s.status === "FAILED").length;
+    console.log(`Active: ${active} | Failed: ${failed}\n`);
+
+    console.log("1. Start New Stream");
+    console.log("2. Stop Active Stream");
+    console.log("3. Restart Stopped/Failed Stream");
+    console.log("4. View Dashboard (Details)");
+    console.log("5. Cleanup (Clear Stopped/Failed entries)");
+    console.log("6. Back\n");
+
+    const choice = await ask("Enter choice: ");
+
+    if (choice === "1") await startNewStream();
+    else if (choice === "2") await stopStream();
+    else if (choice === "3") await restartStream();
+    else if (choice === "4") viewDashboard();
+    else if (choice === "5") await cleanupStreams();
+    else if (choice === "6") return mainMenu();
+  }
+}
+
+// --- DESTINATION MENU ---
+async function destMenu() {
+  while(true) {
+    console.log("\n--- MANAGE DESTINATIONS ---\n");
+    if (destinations.length === 0) console.log("No destinations saved.\n");
+    else {
+      destinations.forEach((d, i) => console.log(`${i + 1}. ${d.name}`));
+      console.log("");
+    }
+
+    console.log("1. Add Destination");
+    console.log("2. Remove Destination");
+    console.log("3. Back\n");
+
+    const choice = await ask("Enter choice: ");
+
+    if (choice === "1") {
+      const name = await ask("Name: ");
+      const rtmp = await ask("RTMP URL: ");
+      const key = await ask("Stream Key: ");
+      destinations.push({ name, rtmp, key });
+      saveDest();
+      console.log("✅ Destination added.");
+    } else if (choice === "2") {
+      if (destinations.length === 0) {
+        console.log("Nothing to remove.");
+        continue;
+      }
+      const idx = parseInt(await ask("Enter number to remove: ")) - 1;
+      if (idx >= 0 && idx < destinations.length) {
+        console.log(`Removed: ${destinations[idx].name}`);
+        destinations.splice(idx, 1);
+        saveDest();
+      } else {
+        console.log("Invalid selection.");
+      }
+    } else if (choice === "3") {
+      return mainMenu();
+    }
+  }
+}
+
+// ================= ACTIONS =================
+
+async function startNewStream() {
+  if (destinations.length === 0) {
+    console.log("❌ No destinations found. Please add one in Manage Destinations.");
+    return;
+  }
+
+  const id = await ask("Stream ID: ");
+  if (streams[id]) {
+    console.log("⚠️  ID exists. Stop it first or use a different ID.");
+    return;
+  }
+
+  // Select Dest
+  destinations.forEach((d, i) => console.log(`${i + 1}. ${d.name}`));
+  const dIdx = parseInt(await ask("Select Destination: ")) - 1;
+  if (dIdx < 0 || dIdx >= destinations.length) return console.log("Invalid selection.");
+
+  // Config
+  const url = await ask("Video URL: ");
+  const cookiesFile = (await ask("Cookies file (leave blank): ")).trim();
+  
+  let usePipe = false;
+  if (hasYtdlp) {
+    usePipe = (await ask("Use Pipe Mode? (y/n): ")).toLowerCase().startsWith('y');
+  }
+
+  let resolvedUrl = null;
+  if (!usePipe && hasYtdlp) {
+    if ((await ask("Resolve URL? (y/n): ")).toLowerCase().startsWith('y')) {
+      console.log("Resolving...");
+      resolvedUrl = resolveInputUrl(url, cookiesFile || null);
+      if(resolvedUrl) console.log("✅ Resolved.");
+    }
+  }
+
+  let loop = false;
+  if (!usePipe) {
+    loop = (await ask("Loop? (y/n): ")).toLowerCase().startsWith('y');
+  }
+
+  launchStream(id, {
+    url, destIndex: dIdx, usePipe, loop, cookiesFile, resolvedUrl
+  });
+}
+
+async function stopStream() {
+  const ids = Object.keys(streams).filter(id => streams[id].status === "LIVE" || streams[id].status === "STARTING");
+  if (ids.length === 0) return console.log("No active streams.");
+
+  ids.forEach((id, i) => console.log(`${i + 1}. ${id}`));
+  const choice = parseInt(await ask("Select stream to stop: ")) - 1;
+  const id = ids[choice];
+
+  if (!id) return console.log("Invalid.");
+
+  try {
+    if (streams[id].pid) process.kill(streams[id].pid);
+    if (streams[id].ytdlpPid) process.kill(streams[id].ytdlpPid);
+    streams[id].status = "STOPPED";
+    saveStreams();
+    console.log(`🛑 Stopped ${id}`);
+  } catch (e) {
+    console.log("Error stopping process.");
+  }
+}
+
+async function restartStream() {
+  const ids = Object.keys(streams).filter(id => streams[id].status !== "LIVE" && streams[id].status !== "STARTING");
+  if (ids.length === 0) return console.log("No stopped/failed streams to restart.");
 
   ids.forEach((id, i) => {
     console.log(`${i + 1}. ${id} (${streams[id].status})`);
   });
+  const choice = parseInt(await ask("Select stream to restart: ")) - 1;
+  const id = ids[choice];
 
-  const choice = await ask("Select stream to stop: ");
-  const id = ids[parseInt(choice) - 1];
+  if (!id || !streams[id].config) return console.log("Cannot restart (old config missing).");
 
-  if (!id) {
-    console.log("Invalid selection.\n");
-    return menu();
-  }
-
-  killStream(id);
-  console.log(`🛑 Stopped ${id}\n`);
-  menu();
+  // Launch with saved config
+  launchStream(id, streams[id].config);
 }
 
-function killStream(id) {
-  const s = streams[id];
-  if (!s) return;
-
-  try {
-    if (s.pid) process.kill(s.pid);
-  } catch (e) {}
-
-  try {
-    if (s.ytdlpPid) process.kill(s.ytdlpPid);
-  } catch (e) {}
-
-  s.status = "STOPPED";
-  saveStreams();
-}
-
-// ================= DASHBOARD =================
-function view() {
+function viewDashboard() {
   console.log("\n========= DASHBOARD =========\n");
-
-  const active = [];
-  const failed = [];
-  const stopped = [];
-
   for (let id in streams) {
     const s = streams[id];
-    if (s.status === "LIVE" || s.status === "STARTING") active.push(id);
-    else if (s.status === "FAILED") failed.push(id);
-    else stopped.push(id);
+    const icon = s.status === "LIVE" ? "🟢" : (s.status === "FAILED" ? "🔴" : "⚫");
+    console.log(`${icon} ${id} | ${s.platform} | ${s.status}`);
+    if (s.error) console.log(`   Error: ${s.error.substring(0, 50)}...`);
   }
-
-  console.log("🟢 ACTIVE STREAMS:");
-  if (active.length === 0) console.log("  None");
-  active.forEach((id) => {
-    const s = streams[id];
-    console.log(`  - ${id} | Platform: ${s.platform} | Mode: ${s.mode}`);
-    console.log(`    Started: ${s.started}`);
-  });
-
-  console.log("\n🔴 FAILED STREAMS:");
-  if (failed.length === 0) console.log("  None");
-  failed.forEach((id) => {
-    const s = streams[id];
-    console.log(`  - ${id}`);
-    console.log(`    Error: ${s.error}`);
-  });
-
-  console.log("\n⚫ STOPPED STREAMS:");
-  if (stopped.length === 0) console.log("  None");
-  stopped.forEach((id) => {
-    console.log(`  - ${id}`);
-    if(streams[id].error) console.log(`    Reason: ${streams[id].error}`);
-  });
-
-  console.log("\n=============================\n");
-  menu();
+  console.log("=============================\n");
 }
 
-// ================= CLEANUP =================
-async function cleanup() {
-  const confirm = await ask("Clear stopped/failed streams? (y/n): ");
-  if (confirm.toLowerCase() !== "y") return menu();
-
+async function cleanupStreams() {
+  console.log("\n1. Clear Stopped only");
+  console.log("2. Clear Failed only");
+  console.log("3. Clear All (non-active)");
+  console.log("4. Cancel\n");
+  
+  const choice = await ask("Select option: ");
+  
   for (let id in streams) {
-    if (streams[id].status !== "LIVE" && streams[id].status !== "STARTING") {
-      delete streams[id];
-    }
+    const s = streams[id];
+    let del = false;
+    if (choice === "1" && s.status === "STOPPED") del = true;
+    if (choice === "2" && s.status === "FAILED") del = true;
+    if (choice === "3" && s.status !== "LIVE" && s.status !== "STARTING") del = true;
+
+    if (del) delete streams[id];
   }
-  saveStreams();
-  console.log("🧹 Cleaned up\n");
-  menu();
+  
+  if (choice !== "4") {
+    saveStreams();
+    console.log("🧹 Cleanup done.");
+  }
 }
 
-// ================= START APP =================
-menu();
+// Start App
+mainMenu();
