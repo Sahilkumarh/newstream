@@ -1,13 +1,3 @@
-You are absolutely right. If the RTMP URL has a trailing slash (e.g., `.../live2/`) and the Stream Key has a leading slash (e.g., `/key`), the script creates `.../live2//key`, which causes connection failures.
-
-Here is the verified and fixed script.
-
-**What I fixed:**
-1.  **Smart URL Joining:** I added a helper function that removes extra slashes from the RTMP URL and Stream Key before combining them. This guarantees the format is always correct.
-2.  **Verification Log:** Before starting, it now prints exactly: `Connecting to: [URL]` so you can visually confirm the link is perfect.
-3.  **Retained previous fixes:** Still includes the EPIPE fix, Transcoding fix, and Error Logging.
-
-```javascript
 const readline = require("readline");
 const { spawn, spawnSync } = require("child_process");
 const fs = require("fs");
@@ -523,4 +513,3 @@ async function cleanup() {
 
 // ================= START APP =================
 menu();
-```
