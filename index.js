@@ -20,7 +20,7 @@ const ui = {
     console.log(`${Colors.bright}${Colors.cyan}═══════════════════════════════════════════════════════${Colors.reset}\n`);
   },
   log: (msg, color = "reset") => console.log(`${Colors[color]}${msg}${Colors.reset}`),
-  error: (msg) => console.log(`${Colors.red}❌ ${msg}${Colors.reset}`),
+  error: (msg) => console.log(`${Colors.red}❌ Error: ${msg}${Colors.reset}`),
   success: (msg) => console.log(`${Colors.green}✅ ${msg}${Colors.reset}`),
   ask: (q) => new Promise(r => rl.question(q, r)),
   wait: () => new Promise(r => rl.question("\n[Press Enter to continue...] ", r))
@@ -29,7 +29,7 @@ const ui = {
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
 // ==========================================
-// 💾 DATA LAYER (Safe Persistence)
+// 💾 DATA LAYER (Crash Safe)
 // ==========================================
 const FILES = {
   STREAMS: "phoenix_streams.json",
@@ -44,15 +44,20 @@ const DB = {
   presets: [],
   
   init: () => {
-    // Safe load with fallbacks
-    const load = (f, def) => fs.existsSync(f) ? JSON.parse(fs.readFileSync(f)) : def;
+    const load = (f, def) => {
+      try {
+        if (fs.existsSync(f)) return JSON.parse(fs.readFileSync(f));
+      } catch (e) {
+        ui.error(`Corrupt file ${f}. Resetting it.`);
+      }
+      return def;
+    };
+    
     DB.streams = load(FILES.STREAMS, {});
     DB.dests = load(FILES.DESTS, []);
     DB.presets = load(FILES.PRESETS, []);
 
-    // CRITICAL FIX 2: The "Dead PID" Problem
-    // On restart, we cannot trust PIDs. Reset them to null.
-    // Reset any "LIVE" streams to "STOPPED" because they are definitely dead if we just started.
+    // Sanitize PIDs (Fix for restarts)
     let recovered = 0;
     for (let id in DB.streams) {
       if (DB.streams[id].status === "LIVE" || DB.streams[id].status === "STARTING") {
@@ -62,9 +67,7 @@ const DB = {
         recovered++;
       }
     }
-    if (recovered > 0) {
-      ui.log(`System Boot: Reset ${recovered} orphaned streams.`, "yellow");
-    }
+    if (recovered > 0) ui.log(`Cleaned up ${recovered} orphaned streams.`, "yellow");
     DB.save("STREAMS");
   },
 
@@ -74,57 +77,72 @@ const DB = {
   }
 };
 
-// CRITICAL FIX 8: Safe yt-dlp check
+// Tool Checks
+let hasFfmpeg = false;
 let hasYtdlp = false;
-try {
-  hasYtdlp = spawnSync("yt-dlp", ["--version"]).status === 0;
-} catch (e) {
-  ui.log("Warning: yt-dlp check failed.", "yellow");
-}
+try { hasFfmpeg = spawnSync("ffmpeg", ["-version"]).status === 0; } catch(e){}
+try { hasYtdlp = spawnSync("yt-dlp", ["--version"]).status === 0; } catch(e){}
+
+if (!hasFfmpeg) ui.error("FFmpeg not found in PATH. Streaming will not work.", "red");
+if (!hasYtdlp) ui.log("Warning: yt-dlp not found. URL resolution disabled.", "yellow");
 
 // ==========================================
-// ⚙️ ENGINE (Async & Robust)
+// ⚙️ ENGINE (Crash Proof)
 // ==========================================
 const Engine = {
-  // CRITICAL FIX 3: Async Resolution (Non-blocking)
   resolve: (url) => {
     return new Promise((resolve) => {
       if (!hasYtdlp || !url.startsWith("http")) return resolve(null);
       
-      const child = spawn("yt-dlp", [
-        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best", 
-        "-g", url
-      ]);
+      let child;
+      try {
+        child = spawn("yt-dlp", [
+          "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best", 
+          "-g", url
+        ]);
+      } catch (e) {
+        return resolve(null);
+      }
       
       let output = "";
       child.stdout.on("data", d => output += d.toString());
+      
+      // Safety timeout
+      const timer = setTimeout(() => { 
+        try { child.kill(); } catch(e){}
+        resolve(null); 
+      }, 10000);
+
       child.on("close", (code) => {
+        clearTimeout(timer);
         if (code !== 0) return resolve(null);
         const lines = output.trim().split("\n").filter(l => l.startsWith("http"));
         if (lines.length >= 2) return resolve({ video: lines[0], audio: lines[1] });
         if (lines.length === 1) return resolve({ video: lines[0], audio: null });
         resolve(null);
       });
-      // 10s timeout for resolution
-      setTimeout(() => { child.kill(); resolve(null); }, 10000);
     });
   },
 
   launch: async (id, config) => {
+    // 1. Validations
+    if (!config.source || config.source.trim() === "") return ui.error("Source cannot be empty.");
+    if (!hasFfmpeg) return ui.error("Cannot start: FFmpeg is missing.");
+    
     const dest = DB.dests[config.destIndex];
-    if (!dest) return ui.error("Destination configuration missing.");
+    if (!dest) return ui.error(`Destination index ${config.destIndex} does not exist. Please add a destination.`);
 
     ui.log(`🚀 Launching ${id}...`, "cyan");
 
-    // 1. Validate Source
+    // 2. Check Source Type
     let isLocal = false;
     try {
-      // CRITICAL FIX 7: Check if it's a file or directory
+      // Check if it's a file
       const stat = fs.statSync(config.source);
       if (stat.isFile()) isLocal = true;
-      else if (stat.isDirectory()) return ui.error("Source is a directory, not a file.");
+      else if (stat.isDirectory()) return ui.error("Source is a folder, not a file.");
     } catch (e) {
-      // Doesn't exist locally, assume URL
+      // It's likely a URL or non-existent local file
     }
 
     let inputArgs = [];
@@ -135,7 +153,6 @@ const Engine = {
       inputArgs = ["-re", "-i", config.source];
     } else {
       ui.log("   Source: Remote URL (Resolving...)", "yellow");
-      // Always resolve fresh. (CRITICAL FIX 6: Don't save expired tokens)
       const urls = await Engine.resolve(config.source);
       
       if (urls && urls.audio) {
@@ -144,12 +161,12 @@ const Engine = {
       } else if (urls) {
         inputArgs = ["-re", "-i", urls.video];
       } else {
-        ui.log("   Resolution failed. Using raw URL.", "yellow");
+        ui.log("   Resolution failed. Trying raw URL...", "yellow");
         inputArgs = ["-re", "-i", config.source];
       }
     }
 
-    // 2. Construct Command
+    // 3. Spawn FFmpeg
     const rtmp = `${dest.rtmp.replace(/\/$/, '')}/${dest.key.replace(/^\//, '')}`;
     const ffmpegArgs = [
       ...inputArgs, ...mapArgs,
@@ -158,15 +175,16 @@ const Engine = {
       rtmp
     ];
 
-    // 3. Spawn
-    // CRITICAL FIX 9: Log Clutter. Redirect stderr to file stream, not inherit.
-    const logStream = fs.createWriteStream(FILES.LOGS, { flags: 'a' });
+    let ffmpeg;
+    try {
+      // Redirect stderr to log file to keep console clean
+      const logStream = fs.createWriteStream(FILES.LOGS, { flags: 'a' });
+      ffmpeg = spawn("ffmpeg", ffmpegArgs, { stdio: ["ignore", "ignore", "pipe"] });
+      ffmpeg.stderr.pipe(logStream);
+    } catch (e) {
+      return ui.error(`Failed to spawn FFmpeg: ${e.message}`);
+    }
     
-    const ffmpeg = spawn("ffmpeg", ffmpegArgs, { stdio: ["ignore", "ignore", "pipe"] });
-    
-    // Pipe stderr to both log file AND our monitor logic
-    ffmpeg.stderr.pipe(logStream);
-
     // 4. Update State
     DB.streams[id] = {
       ...DB.streams[id],
@@ -175,37 +193,28 @@ const Engine = {
       startTime: Date.now(),
       source: config.source,
       platform: dest.name,
-      config: config, // Save intent, not resolved URLs
+      config: config,
       retryCount: (DB.streams[id]?.retryCount || 0)
     };
     DB.save("STREAMS");
 
-    // 5. Monitor (Rolling Buffer for Live Detection)
-    // CRITICAL FIX 4: Fix chunking issue
+    // 5. Monitor
     let buffer = "";
-    
     ffmpeg.stderr.on("data", (chunk) => {
       buffer += chunk.toString();
-      // Keep buffer size manageable (e.g., last 1000 chars)
       if (buffer.length > 1000) buffer = buffer.slice(-1000);
 
       if (buffer.includes("Press [q]")) {
         if (DB.streams[id].status !== "LIVE") {
           DB.streams[id].status = "LIVE";
-          DB.streams[id].retryCount = 0; // Reset retries on success
+          DB.streams[id].retryCount = 0;
           DB.save("STREAMS");
           ui.success(`${id} is LIVE`);
         }
       }
-      
-      // Log errors to console but not frame stats
-      if (chunk.toString().toLowerCase().includes("error")) {
-         ui.log(`[FFmpeg Error] ${chunk.toString().trim().substring(0, 50)}`, "red");
-      }
     });
 
     ffmpeg.on("exit", (code) => {
-      logStream.end();
       const s = DB.streams[id];
       if (!s) return;
 
@@ -215,8 +224,7 @@ const Engine = {
       const currentRetries = s.retryCount || 0;
 
       if (crashed && shouldRestart && currentRetries < maxRetries) {
-        // CRITICAL FIX 5: Infinite Loop Prevention
-        const delay = Math.min(currentRetries * 2, 30) * 1000; // Cap at 30s wait
+        const delay = Math.min(currentRetries * 2, 30) * 1000;
         ui.log(`💥 ${id} Crashed. Retry ${currentRetries}/${maxRetries} in ${delay/1000}s...`, "yellow");
         
         s.status = "RETRYING";
@@ -234,19 +242,17 @@ const Engine = {
 
   kill: (pid) => {
     if (!pid) return;
-    try { process.kill(pid, "SIGTERM"); } catch(e) {}
-    try { setTimeout(() => process.kill(pid, "SIGKILL"), 2000); } catch(e) {}
+    try { process.kill(pid, "SIGTERM"); } catch(e){}
+    try { setTimeout(() => process.kill(pid, "SIGKILL"), 2000); } catch(e){}
   }
 };
 
 // ==========================================
-// 📅 SCHEDULER (Persistent)
+// 📅 SCHEDULER
 // ==========================================
 const Scheduler = {
   timers: {},
-
   init: () => {
-    // CRITICAL FIX 1: Restore Jobs on Restart
     const now = Date.now();
     for (let id in DB.streams) {
       const s = DB.streams[id];
@@ -257,7 +263,6 @@ const Scheduler = {
           ui.log(`⏰ Restoring Schedule: ${id}`, "magenta");
           Scheduler.set(id, s.config, diff);
         } else {
-          // Time passed
           s.status = "FAILED";
           s.lastError = "Scheduled time passed while offline";
           DB.save("STREAMS");
@@ -265,17 +270,14 @@ const Scheduler = {
       }
     }
   },
-
   set: (id, config, delayMs) => {
     if (Scheduler.timers[id]) clearTimeout(Scheduler.timers[id]);
-    
     Scheduler.timers[id] = setTimeout(() => {
       ui.log(`⏰ Triggering: ${id}`, "magenta");
       delete Scheduler.timers[id];
       Engine.launch(id, config);
     }, delayMs);
   },
-
   clear: (id) => {
     if (Scheduler.timers[id]) clearTimeout(Scheduler.timers[id]);
     delete Scheduler.timers[id];
@@ -287,8 +289,8 @@ const Scheduler = {
 // ==========================================
 
 async function mainMenu() {
-  DB.init(); // Load data & sanitize PIDs
-  Scheduler.init(); // Restore scheduled jobs
+  DB.init();
+  Scheduler.init();
 
   while (true) {
     const active = Object.values(DB.streams).filter(s => s.status === "LIVE").length;
@@ -304,13 +306,17 @@ async function mainMenu() {
     console.log(`  ${Colors.cyan}4.${Colors.reset} Destinations`);
     console.log(`  ${Colors.gray}0.${Colors.reset} Exit\n`);
 
-    const choice = await ui.ask("Select: ");
-    
-    if (choice === "1") await menuStart();
-    else if (choice === "2") await menuDashboard();
-    else if (choice === "3") await menuPresets();
-    else if (choice === "4") await menuDests();
-    else if (choice === "0") process.exit(0);
+    try {
+      const choice = await ui.ask("Select: ");
+      if (choice === "1") await menuStart();
+      else if (choice === "2") await menuDashboard();
+      else if (choice === "3") await menuPresets();
+      else if (choice === "4") await menuDests();
+      else if (choice === "0") process.exit(0);
+    } catch (e) {
+      ui.error(`Menu Error: ${e.message}`);
+      await ui.wait();
+    }
   }
 }
 
@@ -331,14 +337,24 @@ async function menuStart() {
 }
 
 async function actionQuick() {
-  if (DB.dests.length === 0) return ui.error("No destinations. Add one first.");
+  if (DB.dests.length === 0) {
+    ui.error("No destinations found. Please add one in the Destinations menu first.");
+    await ui.wait();
+    return;
+  }
+
   const id = await ui.ask("Stream ID: ");
+  if (DB.streams[id]) {
+    ui.error("Stream ID already exists. Stop or delete it first.");
+    await ui.wait();
+    return;
+  }
+
   const source = await ui.ask("Source (URL or File Path): ");
   
-  // Simple config
   const config = {
-    source,
-    destIndex: 0,
+    source: source.trim(),
+    destIndex: 0, // Uses the first destination
     autoRestart: true,
     maxRetries: 5
   };
@@ -348,19 +364,33 @@ async function actionQuick() {
 }
 
 async function actionPreset() {
-  if (DB.presets.length === 0) return ui.log("No presets found.", "yellow");
+  if (DB.presets.length === 0) {
+    ui.log("No presets found. Create one in the Presets menu.", "yellow");
+    await ui.wait();
+    return;
+  }
+
   DB.presets.forEach((p, i) => console.log(`  ${i+1}. ${p.name}`));
-  const idx = parseInt(await ui.ask("Preset #: ")) - 1;
+  const idxStr = await ui.ask("Preset #: ");
+  const idx = parseInt(idxStr) - 1;
   
   if (idx >= 0 && DB.presets[idx]) {
     const id = await ui.ask("Stream ID: ");
     await Engine.launch(id, DB.presets[idx].config);
     await ui.wait();
+  } else {
+    ui.error("Invalid selection.");
+    await ui.wait();
   }
 }
 
 async function actionSchedule() {
-  if (DB.dests.length === 0) return ui.error("No destinations.");
+  if (DB.dests.length === 0) {
+    ui.error("No destinations found.");
+    await ui.wait();
+    return;
+  }
+
   const id = await ui.ask("Stream ID: ");
   const source = await ui.ask("Source: ");
   const timeStr = await ui.ask("Time (HH:MM 24h): ");
@@ -371,7 +401,7 @@ async function actionSchedule() {
   if (target <= Date.now()) target.setDate(target.getDate() + 1);
 
   const config = {
-    source,
+    source: source.trim(),
     destIndex: 0,
     autoRestart: true,
     maxRetries: 5,
@@ -395,7 +425,6 @@ async function menuDashboard() {
     else {
       console.log(`  ${Colors.bright}ID\tSTATUS\t\tSOURCE${Colors.reset}`);
       console.log("  ───────────────────────────────────────────────────");
-      
       keys.forEach(k => {
         const s = DB.streams[k];
         let c = "gray";
@@ -403,7 +432,6 @@ async function menuDashboard() {
         if (s.status === "FAILED") c = "red";
         if (s.status === "SCHEDULED") c = "magenta";
         if (s.status === "RETRYING") c = "yellow";
-
         const src = s.source.length > 20 ? s.source.substring(0, 17)+"..." : s.source;
         console.log(`  ${k}\t${Colors[c]}${s.status}${Colors.reset}\t${src}`);
       });
@@ -440,7 +468,7 @@ async function menuDashboard() {
     } else if (c === "3") {
        if (fs.existsSync(FILES.LOGS)) {
          const logs = fs.readFileSync(FILES.LOGS, "utf-8");
-         console.log(logs.slice(-2000)); // Last 2KB
+         console.log(logs.slice(-2000)); 
        } else ui.log("No logs.", "gray");
        await ui.wait();
     } else if (c === "0") return;
@@ -452,7 +480,7 @@ async function menuPresets() {
     ui.header("PRESETS");
     DB.presets.forEach((p, i) => console.log(`  ${i+1}. ${p.name}`));
     console.log("");
-    console.log(`  1. Save Current`);
+    console.log(`  1. Save Current (Stream must be active/stopped)`);
     console.log(`  2. Create New`);
     console.log(`  3. Delete`);
     console.log(`  0. Back\n`);
@@ -465,19 +493,28 @@ async function menuPresets() {
         DB.presets.push({ name, config: DB.streams[id].config });
         DB.save("PRESETS");
         ui.success("Saved.");
-      }
+      } else ui.error("Stream not found or no config data.");
       await ui.wait();
     } else if (c === "2") {
       const name = await ui.ask("Name: ");
       const src = await ui.ask("Source: ");
       const dIdx = parseInt(await ui.ask("Dest Index: "));
+      if (!DB.dests[dIdx]) {
+        ui.error("Invalid destination index.");
+        await ui.wait();
+        continue;
+      }
       DB.presets.push({ name, config: { source: src, destIndex: dIdx, autoRestart: true }});
       DB.save("PRESETS");
       ui.success("Created.");
       await ui.wait();
     } else if (c === "3") {
        const idx = parseInt(await ui.ask("#: ")) - 1;
-       if (idx >= 0) { DB.presets.splice(idx, 1); DB.save("PRESETS"); ui.success("Deleted."); }
+       if (idx >= 0 && DB.presets[idx]) { 
+         DB.presets.splice(idx, 1); 
+         DB.save("PRESETS"); 
+         ui.success("Deleted."); 
+       }
        await ui.wait();
     } else if (c === "0") return;
   }
@@ -486,7 +523,7 @@ async function menuPresets() {
 async function menuDests() {
   while (true) {
     ui.header("DESTINATIONS");
-    DB.dests.forEach((d, i) => console.log(`  ${i+1}. ${d.name}`));
+    DB.dests.forEach((d, i) => console.log(`  ${i+1}. ${d.name} (${d.rtmp})`));
     console.log("");
     console.log(`  1. Add`);
     console.log(`  2. Remove`);
